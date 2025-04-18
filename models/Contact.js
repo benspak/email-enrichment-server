@@ -1,4 +1,3 @@
-
 import mongoose from 'mongoose';
 
 const contactSchema = new mongoose.Schema({
@@ -18,7 +17,7 @@ const contactSchema = new mongoose.Schema({
       verified: Boolean
     }
   ],
-  verifiedEmail: String,
+  guessedEmail: String,
   status: String
 }, { timestamps: true });
 

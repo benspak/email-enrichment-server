@@ -17,11 +17,10 @@ import Contact from '../models/Contact.js';
 import Job from '../models/Job.js';
 
 dotenv.config();
-
 const resend = new Resend(process.env.RESEND_API_KEY);
 const pipe = promisify(pipeline);
 
-const BATCH_SIZE = 25; // Reduce for memory safety
+const BATCH_SIZE = 25;
 const SCRAPE_CONCURRENCY = 6;
 const VERIFY_CONCURRENCY = 8;
 
@@ -29,174 +28,137 @@ global.queue = [];
 
 const cacheFile = path.join('cache', 'verifiedPatternCache.json');
 let verifiedPatternCache = new Map();
-
 try {
   if (fs.existsSync(cacheFile)) {
-    const json = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
-    verifiedPatternCache = new Map(Object.entries(json));
+    verifiedPatternCache = new Map(Object.entries(JSON.parse(fs.readFileSync(cacheFile, 'utf-8'))));
     console.log(`🧠 Pattern cache loaded (${verifiedPatternCache.size} entries)`);
   }
 } catch (err) {
-  console.warn('⚠️ Failed to load pattern cache:', err.message);
+  console.warn('⚠️ Could not load pattern cache:', err.message);
 }
-
-function savePatternCacheToDisk() {
+const savePatternCacheToDisk = () => {
   try {
-    const json = JSON.stringify(Object.fromEntries(verifiedPatternCache), null, 2);
-    fs.writeFileSync(cacheFile, json, 'utf-8');
+    fs.writeFileSync(cacheFile, JSON.stringify(Object.fromEntries(verifiedPatternCache), null, 2));
     console.log('💾 Pattern cache saved');
   } catch (err) {
-    console.error('❌ Failed to save pattern cache:', err);
+    console.error('❌ Failed to save cache:', err);
   }
-}
+};
 
 export const queueProcessor = () => {
   setInterval(async () => {
-    try {
-      if (global.queue.length === 0) return;
+    if (global.queue.length === 0) return;
 
-      const queueItem = global.queue.shift();
-      const { jobId, email, filePath } = queueItem;
+    const queueItem = global.queue.shift();
+    const { jobId, email, filePath } = queueItem;
 
-      const job = await Job.findById(jobId);
-      if (!job) return;
+    const job = await Job.findById(jobId);
+    if (!job) return;
 
-      job.status = 'processing';
-      await job.save();
+    const startTime = Date.now();
+    job.status = 'processing';
+    await job.save();
 
-      const enriched = [];
-      let batch = [];
+    const enriched = [];
+    let batch = [];
+    let skippedRows = 0;
 
-      const scrapeLimiter = pLimit(SCRAPE_CONCURRENCY);
-      const verifyLimiter = pLimit(VERIFY_CONCURRENCY);
+    const scrapeLimiter = pLimit(SCRAPE_CONCURRENCY);
+    const verifyLimiter = pLimit(VERIFY_CONCURRENCY);
 
-      const clean = (text) => text?.replace(/["().,]|👨‍💻|👩‍💻|👨‍🔬|MBA|PhD|Dr\.?/gi, '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .toLowerCase();
+    const processBatch = async (batchToProcess) => {
+      const results = await Promise.all(batchToProcess.map(contact => scrapeLimiter(async () => {
+        try {
+          const domain = contact.domain;
+          const patterns = generateEmailPatterns(contact.firstName, contact.lastName, domain);
 
-      const processBatch = async (batchToProcess) => {
-        const results = await Promise.all(
-          batchToProcess.map((contact) =>
-            scrapeLimiter(async () => {
-              try {
-                contact.firstName = clean(contact.firstName || '');
-                contact.lastName = clean(contact.lastName || '');
+          for (const pattern of patterns) {
+            const key = `${domain}|${pattern.pattern}`;
+            if (verifiedPatternCache.has(key)) {
+              contact.guessedEmail = pattern.email;
+              contact.guessedEmails = patterns.map(p => ({
+                ...p,
+                verified: p.email === pattern.email
+              }));
+              console.log(`⚡ Reused verified pattern for ${contact.firstName} ${contact.lastName}: ${pattern.pattern}`);
+              return contact;
+            }
+          }
 
-                if (!contact.lastName && contact.firstName.includes(' ')) {
-                  const [first, ...rest] = contact.firstName.split(' ');
-                  contact.firstName = first;
-                  contact.lastName = rest.join(' ');
-                }
+          contact.guessedEmails = patterns;
+          let bestScore = 0;
+          let bestGuess = null;
 
-                const existing = await Contact.findOne({ linkedinUrl: contact.linkedinUrl });
-                if (existing?.verifiedEmail) {
-                  console.log(`✅ Already verified: ${contact.linkedinUrl}`);
-                  return existing;
-                }
+          for (const guess of contact.guessedEmails) {
+            const isValid = await verifyLimiter(() => verifyEmailSMTP(guess.email));
+            guess.verified = isValid;
 
-                const domain = await getDomainFromCompany(contact.company);
-                contact.domain = domain || null;
-
-                for (let [key, value] of verifiedPatternCache.entries()) {
-                  if (key.startsWith(domain + '|')) {
-                    contact.verifiedEmail = value;
-                    console.log(`⚡ Reused cache for ${domain}: ${value}`);
-                    return contact;
-                  }
-                }
-
-                contact.guessedEmails = generateEmailPatterns(contact.firstName, contact.lastName, contact.domain)
-                  .map((g) => ({
-                    email: g.email,
-                    pattern: g.pattern,
-                    confidence: g.confidence,
-                    verified: false
-                  }));
-
-                let bestGuess = null;
-                let bestScore = 0;
-
-                for (const guess of contact.guessedEmails) {
-                  const isValid = await verifyLimiter(() => verifyEmailSMTP(guess.email));
-                  guess.verified = isValid;
-
-                  if (isValid && guess.confidence > bestScore) {
-                    bestGuess = guess.email;
-                    bestScore = guess.confidence;
-                    verifiedPatternCache.set(`${contact.domain}|${guess.pattern}`, guess.email);
-                  }
-
-                  console.log(`🔍 Tried: ${guess.email} | Verified: ${isValid} | Confidence: ${guess.confidence}`);
-                }
-
-                if (bestGuess) {
-                  contact.verifiedEmail = bestGuess;
-
-                  await Contact.updateOne(
-                    { linkedinUrl: contact.linkedinUrl },
-                    {
-                      $set: {
-                        verifiedEmail: bestGuess,
-                        guessedEmails: contact.guessedEmails
-                      }
-                    },
-                    { upsert: true }
-                  );
-
-                  savePatternCacheToDisk();
-                }
-
-                return contact;
-              } catch (err) {
-                console.error(`❌ processBatch contact failed:`, err.message);
-                return contact;
+            if (isValid) {
+              verifiedPatternCache.set(`${domain}|${guess.pattern}`, true);
+              if (guess.confidence > bestScore) {
+                bestGuess = guess.email;
+                bestScore = guess.confidence;
               }
-            })
-          )
-        );
-
-        enriched.push(...results);
-        job.enriched += results.length;
-        job.total += batchToProcess.length;
-        await job.save();
-      };
-
-      let rowCount = 0;
-      await pipe(
-        fs.createReadStream(filePath)
-          .on('error', (err) => {
-            console.error('❌ File stream error:', err);
-          }),
-        csv()
-          .on('error', (err) => {
-            console.error('❌ CSV parse error:', err);
-          }),
-        async function* (source) {
-          for await (const data of source) {
-            rowCount++;
-            if (rowCount % 500 === 0) {
-              console.log(`⏳ Parsed ${rowCount} rows...`);
             }
 
-            // Inside CSV parsing loop:
+            console.log(`🔍 Tried: ${guess.email} | Verified: ${isValid} | Confidence: ${guess.confidence}`);
+          }
+
+          if (bestGuess) {
+            contact.guessedEmail = bestGuess;
+            await Contact.updateOne(
+              { linkedinUrl: contact.linkedinUrl },
+              { $set: { guessedEmail: bestGuess, guessedEmails: contact.guessedEmails } },
+              { upsert: true }
+            );
+            savePatternCacheToDisk();
+          }
+
+          return contact;
+        } catch (err) {
+          console.error('❌ processBatch error:', err.message);
+          return contact;
+        }
+      })));
+
+      enriched.push(...results);
+      job.enriched += results.length;
+      job.total += batchToProcess.length;
+      await job.save();
+    };
+
+    try {
+      await pipe(
+        fs.createReadStream(filePath).on('error', (err) => console.error('❌ File stream error:', err)),
+        csv().on('error', (err) => console.error('❌ CSV parse error:', err)),
+        async function* (source) {
+          for await (const data of source) {
             const contact = {
-              firstName: data['First Name']?.trim(),
-              lastName: data['Last Name']?.trim(),
-              company: data['Company']?.trim(),
-              position: data['Position']?.trim(),
-              linkedinUrl: data['URL']?.trim(),
+              firstName: data['First Name'],
+              lastName: data['Last Name'],
+              company: data['Company'],
+              position: data['Position'],
+              linkedinUrl: data['URL'],
               connectedOn: data['Connected On'] || '',
               email: data['Email Address'] || null,
               rawEmail: data['Email Address'] || null,
               guessedEmails: [],
-              verifiedEmail: data['Email Address'] || null,
+              guessedEmail: data['Email Address'] || null,
               notes: ''
             };
 
-            // Optional: Warn if names are missing
             if (!contact.firstName || !contact.lastName) {
-              console.warn('⚠️ Missing name fields in row:', data);
+              console.warn('⚠️ Missing name fields in row — skipping:', data);
+              skippedRows++;
+              continue;
+            }
+
+            const companyNormalized = contact.company?.toLowerCase() || '';
+            if (['self', 'self-employed', 'freelancer', 'upwork'].some(term => companyNormalized.includes(term))) {
+              console.log(`🚫 Skipping domain resolution for: ${contact.company}`);
+              contact.domain = '';
+            } else {
+              contact.domain = await getDomainFromCompany(contact.company);
             }
 
             batch.push(contact);
@@ -211,39 +173,44 @@ export const queueProcessor = () => {
           }
         }
       );
-
-      const filename = `${uuidv4()}.csv`;
-      const exportPath = path.join('exports', filename);
-
-      const csvWriter = createObjectCsvWriter({
-        path: exportPath,
-        header: [
-          { id: 'firstName', title: 'First Name' },
-          { id: 'lastName', title: 'Last Name' },
-          { id: 'company', title: 'Company' },
-          { id: 'position', title: 'Position' },
-          { id: 'linkedinUrl', title: 'LinkedIn URL' },
-          { id: 'domain', title: 'Domain' },
-          { id: 'verifiedEmail', title: 'Verified Email' }
-        ]
-      });
-
-      await csvWriter.writeRecords(enriched);
-
-      const fileUrl = `${process.env.BASE_URL}/exports/${filename}`;
-      job.status = 'done';
-      job.downloadLink = fileUrl;
-      await job.save();
-
-      console.log('📬 Sending results to:', email);
-      await resend.emails.send({
-        from: 'onboarding@resend.dev',
-        to: email,
-        subject: '✅ Your contact enrichment is complete',
-        html: `<p>Your contacts are ready. <a href="${fileUrl}">Download here</a>.</p>`
-      });
     } catch (err) {
-      console.error('❌ Queue job failed:', err.stack || err.message);
+      console.error('❌ Pipeline failure:', err);
     }
+
+    const filename = `${uuidv4()}.csv`;
+    const exportPath = path.join('exports', filename);
+    const csvWriter = createObjectCsvWriter({
+      path: exportPath,
+      header: [
+        { id: 'firstName', title: 'First Name' },
+        { id: 'lastName', title: 'Last Name' },
+        { id: 'company', title: 'Company' },
+        { id: 'position', title: 'Position' },
+        { id: 'linkedinUrl', title: 'LinkedIn URL' },
+        { id: 'domain', title: 'Domain' },
+        { id: 'guessedEmail', title: 'Guessed Email' }
+      ]
+    });
+
+    await csvWriter.writeRecords(enriched);
+
+    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const min = Math.floor(elapsed / 60);
+    const sec = elapsed % 60;
+    console.log(`⏱ Job completed in ${min}m ${sec}s`);
+    console.log(`📉 Skipped rows: ${skippedRows}`);
+
+    const fileUrl = `${process.env.BASE_URL}/exports/${filename}`;
+    job.status = 'done';
+    job.downloadLink = fileUrl;
+    await job.save();
+
+    await resend.emails.send({
+      from: 'onboarding@resend.dev',
+      to: email,
+      subject: '✅ Your contact enrichment is complete',
+      html: `<p>Your contacts are ready. <a href="${fileUrl}">Download here</a>.</p>`
+    });
+
   }, 5000);
 };
