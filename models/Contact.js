@@ -1,4 +1,4 @@
-// === 📁 server/models/Contact.js ===
+
 import mongoose from 'mongoose';
 
 const contactSchema = new mongoose.Schema({
@@ -7,8 +7,10 @@ const contactSchema = new mongoose.Schema({
   company: String,
   position: String,
   linkedinUrl: String,
+  connectedOn: String, // Optional metadata
   email: String,
   domain: String,
+  notes: String,
   guessedEmails: [
     {
       email: String,
