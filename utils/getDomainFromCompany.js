@@ -1,23 +1,32 @@
-
+// === 📁 server/utils/getDomainFromCompany.js ===
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
 import fetch from 'node-fetch';
+import { bruteForceDomain } from './bruteForceDomain.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
 
 const domainCache = new Map();
 const overridesPath = path.resolve('./utils/domainOverrides.json');
 const overrides = JSON.parse(fs.readFileSync(overridesPath, 'utf8'));
 
 export const getDomainFromCompany = async (companyName) => {
-  if (domainCache.has(companyName)) return domainCache.get(companyName);
+  if (!companyName || typeof companyName !== 'string') return '';
+  const key = companyName.trim().toLowerCase();
+
+  if (domainCache.has(key)) return domainCache.get(key);
 
   // Load from domain-cache.json if available
   try {
-    const cacheFile = 'domain-cache.json';
+    const cacheFile = path.resolve(__dirname, '../cache/domain-cache.json');
     if (fs.existsSync(cacheFile)) {
       const saved = JSON.parse(fs.readFileSync(cacheFile, 'utf8'));
-      if (saved[companyName] && saved[companyName] !== 'search.app.goo.gl') {
-        domainCache.set(companyName, saved[companyName]);
-        return saved[companyName];
+      if (saved[key] && saved[key] !== 'search.app.goo.gl') {
+        domainCache.set(key, saved[key]);
+        return saved[key];
       }
     }
   } catch (err) {
@@ -25,11 +34,11 @@ export const getDomainFromCompany = async (companyName) => {
   }
 
   // 1. Domain override
-  if (overrides[companyName]) {
-    const domain = overrides[companyName];
-    domainCache.set(companyName, domain);
-    persistCache(companyName, domain);
-    console.log(`📘 Used override for ${companyName}: ${domain}`);
+  if (overrides[key]) {
+    const domain = overrides[key];
+    domainCache.set(key, domain);
+    persistCache(key, domain);
+    console.log(`📘 Used override for ${key}: ${domain}`);
     return domain;
   }
 
@@ -42,11 +51,11 @@ export const getDomainFromCompany = async (companyName) => {
       let domain = suggestions[0].domain;
       if (domain === 'search.app.goo.gl') domain = '';
 
-      console.log(`✅ Clearbit match for ${companyName}:`, domain);
+      console.log(`✅ Clearbit match for ${key}:`, domain);
 
       if (domain && domain !== 'search.app.goo.gl') {
-        domainCache.set(companyName, domain);
-        persistCache(companyName, domain);
+        domainCache.set(key, domain);
+        persistCache(key, domain);
         return domain;
       }
     }
@@ -54,11 +63,27 @@ export const getDomainFromCompany = async (companyName) => {
     console.error('❌ Clearbit API failed:', err);
   }
 
+  // 3. Brute-force fallback
+  try {
+    const fallbackDomain = await bruteForceDomain(companyName);
+    if (fallbackDomain) {
+      domainCache.set(key, fallbackDomain);
+      persistCache(key, fallbackDomain);
+      console.log(`🛠️ Brute-forced domain for ${key}: ${fallbackDomain}`);
+      return fallbackDomain;
+    }
+  } catch (err) {
+    console.warn(`⚠️ Brute-force lookup failed for ${key}:`, err.message);
+  }
+
+  // Final fallback
+  domainCache.set(key, '');
+  persistCache(key, '');
   return '';
 };
 
 function persistCache(company, domain) {
-  const file = 'domain-cache.json';
+  const file = path.resolve(__dirname, '../cache/domain-cache.json');
   let cache = {};
   if (fs.existsSync(file)) {
     try {
